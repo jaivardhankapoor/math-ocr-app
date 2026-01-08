@@ -67,6 +67,10 @@ Thumbs.db
 *.out
 *.toc
 
+# Job queue
+jobs/
+jobs.db
+
 # Temp
 temp_images/
 __tmp_*.tex

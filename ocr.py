@@ -5,9 +5,10 @@ import json
 import logging
 import os
 import sys
+import threading
 from io import BytesIO
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Callable
 
 from google import genai
 from google.genai import types
@@ -19,6 +20,11 @@ from prompts import FIX_PROMPT, PAGE_PROMPT, REFINE_PROMPT
 MODEL = "gemini-3-flash-preview"
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
+
+
+class CancelledException(Exception):
+    """Raised when a job is cancelled"""
+    pass
 
 
 def image_to_part(img: Image.Image) -> types.Part:
@@ -196,6 +202,8 @@ def convert(
     enable_compile_check: bool = False,
     use_cache: bool = True,
     clear_cache: bool = False,
+    cancellation_event: Optional[threading.Event] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> str:
     """
     Convert PDF to LaTeX using 2-pass (or 3-pass if compile check enabled).
@@ -203,6 +211,10 @@ def convert(
     Pass 1: Sequential page extraction with context
     Pass 2: Global refinement
     Pass 3: Optional compile check (disabled by default)
+
+    Args:
+        cancellation_event: Event to signal cancellation
+        progress_callback: Called with (current_page, total_pages, pass_name)
     """
     pdf_path = Path(pdf_path)
     if not pdf_path.exists():
@@ -233,6 +245,11 @@ def convert(
     prev_latex = None
 
     for i, img in enumerate(images, 1):
+        # Check for cancellation
+        if cancellation_event and cancellation_event.is_set():
+            log.info("Cancellation requested")
+            raise CancelledException("Job was cancelled")
+
         cache_file = (cache_dir / f"page_{i:03d}.tex") if use_cache else None
 
         if cache_file and cache_file.exists():
@@ -248,6 +265,10 @@ def convert(
 
         pages.append(latex)
         prev_latex = latex
+
+        # Report progress
+        if progress_callback:
+            progress_callback(i, len(images), "pass_1")
 
     # Save cache metadata
     if use_cache:
@@ -266,12 +287,20 @@ def convert(
 
     # Pass 2: Global refinement
     log.info("Pass 2: Global refinement...")
+    if progress_callback:
+        progress_callback(0, 1, "pass_2")
     doc = refine(client, pages, title) or "\n\n".join(pages)
+    if progress_callback:
+        progress_callback(1, 1, "pass_2")
 
     # Pass 3: Optional compile check
     if enable_compile_check and doc:
         log.info("Pass 3: Compile check and error fixing...")
+        if progress_callback:
+            progress_callback(0, 1, "pass_3")
         doc = compile_fix(client, doc, out_path)
+        if progress_callback:
+            progress_callback(1, 1, "pass_3")
 
     # Write output
     out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -2,83 +2,35 @@
 
 import { useState, useRef, useEffect } from "react";
 
-interface ConversionResult {
+interface Job {
   id: string;
-  latex: string;
-  title: string;
-  pages: number;
   filename: string;
-  timestamp: number;
-}
-
-interface ConversionHistory {
-  results: ConversionResult[];
+  title: string | null;
+  status: string;
+  progress_current: number;
+  progress_total: number;
+  current_pass: string | null;
+  latex: string | null;
+  error: string | null;
+  created_at: number;
+  started_at: number | null;
+  completed_at: number | null;
 }
 
 export default function Home() {
   const [files, setFiles] = useState<File[]>([]);
   const [converting, setConverting] = useState(false);
-  const [result, setResult] = useState<ConversionResult | null>(null);
+  const [result, setResult] = useState<Job | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [apiStatus, setApiStatus] = useState<'checking' | 'online' | 'offline'>('checking');
-  const [history, setHistory] = useState<ConversionResult[]>([]);
-  const [showHistory, setShowHistory] = useState(false);
+  const [jobs, setJobs] = useState<Job[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Load history from localStorage on mount
-  useEffect(() => {
-    const saved = localStorage.getItem('math-ocr-history');
-    if (saved) {
-      try {
-        const data: ConversionHistory = JSON.parse(saved);
-        setHistory(data.results || []);
-      } catch (e) {
-        console.error('Failed to load history:', e);
-      }
-    }
-
-    // Check for interrupted conversion
-    const inProgress = localStorage.getItem('math-ocr-in-progress');
-    if (inProgress) {
-      try {
-        const { filename, startTime } = JSON.parse(inProgress);
-        const elapsed = Math.floor((Date.now() - startTime) / 1000 / 60);
-        setError(
-          `Looks like a conversion of "${filename}" was interrupted ${elapsed} min ago. ` +
-          `Please upload and try again.`
-        );
-        localStorage.removeItem('math-ocr-in-progress');
-      } catch (e) {
-        console.error('Failed to restore in-progress state:', e);
-      }
-    }
-  }, []);
-
-  // Save to history
-  const saveToHistory = (newResult: Omit<ConversionResult, 'id' | 'timestamp'>) => {
-    const result: ConversionResult = {
-      ...newResult,
-      id: Date.now().toString(),
-      timestamp: Date.now(),
-    };
-
-    const updatedHistory = [result, ...history].slice(0, 10); // Keep last 10
-    setHistory(updatedHistory);
-    localStorage.setItem('math-ocr-history', JSON.stringify({ results: updatedHistory }));
-
-    return result;
-  };
-
-  // Clear history
-  const clearHistory = () => {
-    setHistory([]);
-    localStorage.removeItem('math-ocr-history');
-  };
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
   // Check API status on mount
   useEffect(() => {
     const checkApi = async () => {
-      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
       try {
         const response = await fetch(`${apiUrl}/health`, { method: 'GET' });
         setApiStatus(response.ok ? 'online' : 'offline');
@@ -89,7 +41,26 @@ export default function Home() {
     checkApi();
     const interval = setInterval(checkApi, 10000); // Check every 10s
     return () => clearInterval(interval);
-  }, []);
+  }, [apiUrl]);
+
+  // Poll jobs every 2 seconds
+  useEffect(() => {
+    const fetchJobs = async () => {
+      try {
+        const response = await fetch(`${apiUrl}/jobs?limit=50`);
+        if (response.ok) {
+          const data = await response.json();
+          setJobs(data.jobs || []);
+        }
+      } catch (err) {
+        console.error('Failed to fetch jobs:', err);
+      }
+    };
+
+    fetchJobs();
+    const interval = setInterval(fetchJobs, 2000); // Poll every 2 seconds
+    return () => clearInterval(interval);
+  }, [apiUrl]);
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
@@ -117,13 +88,7 @@ export default function Home() {
 
     const file = files[0]; // For now, only convert first file
 
-    // Mark as in-progress
-    localStorage.setItem('math-ocr-in-progress', JSON.stringify({
-      filename: file.name,
-      startTime: Date.now(),
-    }));
-
-    try {
+    try:
       // Read file as base64
       const base64 = await new Promise<string>((resolve, reject) => {
         const reader = new FileReader();
@@ -134,30 +99,17 @@ export default function Home() {
 
       const base64Data = base64.split(',')[1]; // Remove data:application/pdf;base64,
 
-      // Call API
-      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
-
-      let response;
-      try {
-        response = await fetch(`${apiUrl}/convert`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            pdf_base64: base64Data,
-            filename: file.name,
-            title: null,
-            enable_compile_check: false,
-          }),
-        });
-      } catch (fetchError) {
-        throw new Error(
-          `Cannot connect to API server at ${apiUrl}. ` +
-          `Make sure the Python API is running:\n\n` +
-          `  cd math-ocr-app\n` +
-          `  uv run uvicorn api_server:app --reload\n\n` +
-          `Or set NEXT_PUBLIC_API_URL in .env.local`
-        );
-      }
+      // Submit job to queue
+      const response = await fetch(`${apiUrl}/jobs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          pdf_base64: base64Data,
+          filename: file.name,
+          title: null,
+          enable_compile_check: false,
+        }),
+      });
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({ detail: 'Unknown error' }));
@@ -165,42 +117,71 @@ export default function Home() {
       }
 
       const data = await response.json();
+      console.log(`Job submitted: ${data.job_id}`);
 
-      // Save to history
-      const savedResult = saveToHistory({
-        latex: data.latex,
-        title: data.title,
-        pages: data.pages,
-        filename: file.name,
-      });
-
-      setResult(savedResult);
-
-      // Clear in-progress state on success
-      localStorage.removeItem('math-ocr-in-progress');
+      // Clear file selection
+      setFiles([]);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Conversion failed');
-      // Clear in-progress state on error
-      localStorage.removeItem('math-ocr-in-progress');
+      setError(err instanceof Error ? err.message : 'Failed to submit job');
     } finally {
       setConverting(false);
     }
   };
 
-  const handleDownload = () => {
-    if (!result) return;
-    const blob = new Blob([result.latex], { type: 'text/plain' });
+  const handleCancelJob = async (jobId: string) => {
+    try {
+      const response = await fetch(`${apiUrl}/jobs/${jobId}/cancel`, {
+        method: 'POST',
+      });
+      if (!response.ok) {
+        throw new Error('Failed to cancel job');
+      }
+    } catch (err) {
+      console.error('Failed to cancel job:', err);
+    }
+  };
+
+  const handleDeleteJob = async (jobId: string) => {
+    try {
+      const response = await fetch(`${apiUrl}/jobs/${jobId}`, {
+        method: 'DELETE',
+      });
+      if (!response.ok) {
+        throw new Error('Failed to delete job');
+      }
+    } catch (err) {
+      console.error('Failed to delete job:', err);
+    }
+  };
+
+  const handleDownload = (job: Job) => {
+    if (!job.latex) return;
+    const blob = new Blob([job.latex], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${result.title}.tex`;
+    a.download = `${job.title || 'output'}.tex`;
     a.click();
     URL.revokeObjectURL(url);
   };
 
-  const handleCopy = async () => {
-    if (!result) return;
-    await navigator.clipboard.writeText(result.latex);
+  const handleCopy = async (latex: string) => {
+    await navigator.clipboard.writeText(latex);
+  };
+
+  const getStatusBadge = (status: string) => {
+    const styles: Record<string, string> = {
+      queued: 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300',
+      running: 'bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300',
+      completed: 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300',
+      failed: 'bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300',
+      cancelled: 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900 dark:text-yellow-300',
+    };
+    return (
+      <span className={`px-2 py-1 rounded text-xs font-semibold ${styles[status] || styles.queued}`}>
+        {status.toUpperCase()}
+      </span>
+    );
   };
 
   return (
@@ -210,7 +191,7 @@ export default function Home() {
         {apiStatus === 'offline' && (
           <div className="mb-6 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 rounded-lg p-4">
             <div className="flex items-start gap-3">
-              <span className="text-2xl">⚠️</span>
+              <span className="text-2xl">WARNING</span>
               <div className="flex-1">
                 <p className="font-semibold text-yellow-800 dark:text-yellow-200 mb-1">
                   API Server Offline
@@ -219,7 +200,7 @@ export default function Home() {
                   The Python API server is not running. Start it with:
                 </p>
                 <pre className="bg-yellow-100 dark:bg-yellow-900/40 text-yellow-900 dark:text-yellow-100 px-3 py-2 rounded text-xs font-mono">
-                  cd math-ocr-app{'\n'}uv run uvicorn api_server:app --reload
+                  cd math-ocr-app{'\n'}./start.sh
                 </pre>
               </div>
             </div>
@@ -228,7 +209,7 @@ export default function Home() {
         {apiStatus === 'online' && (
           <div className="mb-6 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg p-3">
             <div className="flex items-center gap-2">
-              <span className="text-green-600 dark:text-green-400">✓</span>
+              <span className="text-green-600 dark:text-green-400">CHECK</span>
               <p className="text-sm text-green-700 dark:text-green-300 font-medium">
                 API Server Online
               </p>
@@ -258,7 +239,7 @@ export default function Home() {
             onChange={handleFileSelect}
             className="hidden"
           />
-          <div className="text-6xl mb-4">📄</div>
+          <div className="text-6xl mb-4">FILE</div>
           <p className="text-lg text-gray-700 dark:text-gray-200 mb-2">
             Drop PDF files here or click to browse
           </p>
@@ -286,7 +267,7 @@ export default function Home() {
               disabled={converting}
               className="mt-4 w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 px-6 rounded-lg disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors"
             >
-              {converting ? 'Converting...' : 'Convert to LaTeX'}
+              {converting ? 'Submitting...' : 'Convert to LaTeX'}
             </button>
           </div>
         )}
@@ -298,109 +279,118 @@ export default function Home() {
           </div>
         )}
 
-        {/* Result */}
-        {result && (
+        {/* Jobs List */}
+        {jobs.length > 0 && (
+          <div className="mt-8">
+            <h2 className="text-2xl font-semibold text-gray-900 dark:text-white mb-4">
+              Jobs ({jobs.length})
+            </h2>
+            <div className="space-y-3">
+              {jobs.map((job) => (
+                <div
+                  key={job.id}
+                  className="bg-white dark:bg-gray-800 rounded-lg p-4 border border-gray-200 dark:border-gray-700"
+                >
+                  <div className="flex items-start justify-between mb-2">
+                    <div className="flex-1">
+                      <div className="flex items-center gap-2 mb-1">
+                        <h3 className="font-semibold text-gray-900 dark:text-white">
+                          {job.title || job.filename}
+                        </h3>
+                        {getStatusBadge(job.status)}
+                      </div>
+                      <p className="text-sm text-gray-500 dark:text-gray-400">
+                        {job.filename} • {new Date(job.created_at * 1000).toLocaleString()}
+                      </p>
+                    </div>
+                    <div className="flex gap-2">
+                      {job.status === 'running' || job.status === 'queued' ? (
+                        <button
+                          onClick={() => handleCancelJob(job.id)}
+                          className="bg-red-600 hover:bg-red-700 text-white px-3 py-1.5 rounded text-sm font-medium transition-colors"
+                        >
+                          Cancel
+                        </button>
+                      ) : null}
+                      {job.status === 'completed' && job.latex && (
+                        <>
+                          <button
+                            onClick={() => handleCopy(job.latex!)}
+                            className="bg-gray-100 hover:bg-gray-200 dark:bg-gray-700 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-200 px-3 py-1.5 rounded text-sm font-medium transition-colors"
+                          >
+                            Copy
+                          </button>
+                          <button
+                            onClick={() => handleDownload(job)}
+                            className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded text-sm font-medium transition-colors"
+                          >
+                            Download
+                          </button>
+                          <button
+                            onClick={() => setResult(job)}
+                            className="bg-green-600 hover:bg-green-700 text-white px-3 py-1.5 rounded text-sm font-medium transition-colors"
+                          >
+                            View
+                          </button>
+                        </>
+                      )}
+                      {(job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled') && (
+                        <button
+                          onClick={() => handleDeleteJob(job.id)}
+                          className="bg-gray-600 hover:bg-gray-700 text-white px-3 py-1.5 rounded text-sm font-medium transition-colors"
+                        >
+                          Delete
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Progress bar for running jobs */}
+                  {job.status === 'running' && job.progress_total > 0 && (
+                    <div className="mt-2">
+                      <div className="flex justify-between text-xs text-gray-600 dark:text-gray-400 mb-1">
+                        <span>{job.current_pass || 'Processing'}</span>
+                        <span>Page {job.progress_current}/{job.progress_total}</span>
+                      </div>
+                      <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
+                        <div
+                          className="bg-blue-600 h-2 rounded-full transition-all"
+                          style={{ width: `${(job.progress_current / job.progress_total) * 100}%` }}
+                        ></div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Error message */}
+                  {job.status === 'failed' && job.error && (
+                    <div className="mt-2 text-sm text-red-600 dark:text-red-400">
+                      Error: {job.error}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Result Viewer */}
+        {result && result.latex && (
           <div className="mt-6 bg-white dark:bg-gray-800 rounded-lg p-6">
             <div className="flex items-center justify-between mb-4">
               <div>
                 <h3 className="text-xl font-semibold text-gray-900 dark:text-white">{result.title}</h3>
-                <p className="text-sm text-gray-500 dark:text-gray-400">{result.pages} pages converted</p>
+                <p className="text-sm text-gray-500 dark:text-gray-400">Completed</p>
               </div>
-              <div className="flex gap-2">
-                <button
-                  onClick={handleCopy}
-                  className="bg-gray-100 hover:bg-gray-200 dark:bg-gray-700 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-200 px-4 py-2 rounded-lg text-sm font-medium transition-colors"
-                >
-                  Copy
-                </button>
-                <button
-                  onClick={handleDownload}
-                  className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
-                >
-                  Download .tex
-                </button>
-              </div>
+              <button
+                onClick={() => setResult(null)}
+                className="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+              >
+                Close
+              </button>
             </div>
             <pre className="bg-gray-50 dark:bg-gray-900 rounded-lg p-4 text-xs overflow-x-auto max-h-96 overflow-y-auto border border-gray-200 dark:border-gray-700">
               <code className="text-gray-800 dark:text-gray-200">{result.latex}</code>
             </pre>
-          </div>
-        )}
-
-        {/* History Section */}
-        {history.length > 0 && (
-          <div className="mt-8">
-            <div className="flex items-center justify-between mb-4">
-              <button
-                onClick={() => setShowHistory(!showHistory)}
-                className="flex items-center gap-2 text-gray-700 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white"
-              >
-                <span className="text-xl">{showHistory ? '📂' : '📁'}</span>
-                <h2 className="text-xl font-semibold">
-                  Recent Conversions ({history.length})
-                </h2>
-              </button>
-              {showHistory && (
-                <button
-                  onClick={clearHistory}
-                  className="text-sm text-red-600 dark:text-red-400 hover:underline"
-                >
-                  Clear All
-                </button>
-              )}
-            </div>
-
-            {showHistory && (
-              <div className="space-y-3">
-                {history.map((item) => (
-                  <div
-                    key={item.id}
-                    className="bg-white dark:bg-gray-800 rounded-lg p-4 border border-gray-200 dark:border-gray-700"
-                  >
-                    <div className="flex items-start justify-between">
-                      <div className="flex-1">
-                        <h3 className="font-semibold text-gray-900 dark:text-white">
-                          {item.title}
-                        </h3>
-                        <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
-                          {item.filename} • {item.pages} pages • {new Date(item.timestamp).toLocaleString()}
-                        </p>
-                      </div>
-                      <div className="flex gap-2">
-                        <button
-                          onClick={() => {
-                            navigator.clipboard.writeText(item.latex);
-                          }}
-                          className="bg-gray-100 hover:bg-gray-200 dark:bg-gray-700 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-200 px-3 py-1.5 rounded text-sm font-medium transition-colors"
-                        >
-                          Copy
-                        </button>
-                        <button
-                          onClick={() => {
-                            const blob = new Blob([item.latex], { type: 'text/plain' });
-                            const url = URL.createObjectURL(blob);
-                            const a = document.createElement('a');
-                            a.href = url;
-                            a.download = `${item.title}.tex`;
-                            a.click();
-                            URL.revokeObjectURL(url);
-                          }}
-                          className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded text-sm font-medium transition-colors"
-                        >
-                          Download
-                        </button>
-                        <button
-                          onClick={() => setResult(item)}
-                          className="bg-green-600 hover:bg-green-700 text-white px-3 py-1.5 rounded text-sm font-medium transition-colors"
-                        >
-                          View
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
           </div>
         )}
       </div>
