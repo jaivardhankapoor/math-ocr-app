@@ -9,14 +9,20 @@ import asyncio
 from pathlib import Path
 from typing import Optional, List
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from jose import jwt, JWTError
 
 from ocr import convert
 import database
 from job_queue import get_job_queue
+
+# Get NextAuth secret from environment
+NEXTAUTH_SECRET = os.getenv("NEXTAUTH_SECRET", "")
+if not NEXTAUTH_SECRET:
+    print("WARNING: NEXTAUTH_SECRET not set. Auth will not work!")
 
 app = FastAPI(title="Math OCR API", version="1.0.0")
 
@@ -56,6 +62,48 @@ class JobSubmitResponse(BaseModel):
     status: str
 
 
+class UserSyncRequest(BaseModel):
+    id: str
+    email: str
+    name: Optional[str] = None
+    image: Optional[str] = None
+
+
+class UserResponse(BaseModel):
+    id: str
+    email: str
+    name: Optional[str]
+    tier: str
+    usage_24h: int
+    limit: int
+
+
+# Auth dependency
+async def get_current_user(authorization: str = Header(...)) -> dict:
+    """Verify JWT token and return user payload"""
+    if not NEXTAUTH_SECRET:
+        raise HTTPException(status_code=500, detail="Auth not configured")
+
+    try:
+        # Extract token from "Bearer <token>"
+        if not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Invalid authorization header")
+
+        token = authorization.replace("Bearer ", "")
+
+        # Decode JWT
+        payload = jwt.decode(token, NEXTAUTH_SECRET, algorithms=["HS256"])
+
+        # NextAuth JWT structure: { sub: user_id, email, name, ... }
+        if "sub" not in payload:
+            raise HTTPException(status_code=401, detail="Invalid token: missing sub")
+
+        return payload
+
+    except JWTError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize database and start job queue worker"""
@@ -92,6 +140,53 @@ async def health():
         "status": "healthy",
         "api_key_configured": bool(api_key),
     }
+
+
+# User Endpoints
+
+
+@app.post("/users/sync")
+async def sync_user(req: UserSyncRequest, user: dict = Depends(get_current_user)):
+    """Sync user from NextAuth to database"""
+    # Verify the token user matches the request
+    if user["sub"] != req.id:
+        raise HTTPException(status_code=403, detail="Token mismatch")
+
+    # Create or update user
+    db_user = database.create_user(req.id, req.email, req.name, req.image)
+    return {"message": "User synced", "user": db_user}
+
+
+@app.get("/users/me", response_model=UserResponse)
+async def get_me(user: dict = Depends(get_current_user)):
+    """Get current user info with usage stats"""
+    user_id = user["sub"]
+
+    # Get user from database
+    db_user = database.get_user(user_id)
+    if not db_user:
+        raise HTTPException(status_code=404, detail="User not found in database. Call /users/sync first.")
+
+    # Get usage stats
+    usage_24h = database.get_user_job_count_24h(user_id)
+
+    # Determine limit based on tier
+    tier = db_user["tier"]
+    if tier == "unlimited":
+        limit = -1  # Unlimited
+    elif tier == "paid":
+        limit = 50
+    else:
+        limit = 3
+
+    return UserResponse(
+        id=db_user["id"],
+        email=db_user["email"],
+        name=db_user["name"],
+        tier=tier,
+        usage_24h=usage_24h,
+        limit=limit,
+    )
 
 
 @app.post("/convert", response_model=ConvertResponse)
@@ -212,8 +307,34 @@ async def convert_upload(
 
 
 @app.post("/jobs", response_model=JobSubmitResponse)
-async def submit_job(req: JobSubmitRequest):
+async def submit_job(req: JobSubmitRequest, user: dict = Depends(get_current_user)):
     """Submit a new conversion job to the queue"""
+    user_id = user["sub"]
+
+    # Get user from database
+    db_user = database.get_user(user_id)
+    if not db_user:
+        raise HTTPException(status_code=404, detail="User not found. Call /users/sync first.")
+
+    # Check rate limit
+    tier = db_user["tier"]
+    usage_24h = database.get_user_job_count_24h(user_id)
+
+    if tier == "unlimited":
+        pass  # No limit
+    elif tier == "paid":
+        if usage_24h >= 50:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Daily limit reached ({usage_24h}/50). Try again tomorrow."
+            )
+    else:  # free tier
+        if usage_24h >= 3:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Daily limit reached ({usage_24h}/3). Upgrade to Pro for 50/day."
+            )
+
     # Decode PDF
     try:
         pdf_bytes = base64.b64decode(req.pdf_base64)
@@ -229,6 +350,7 @@ async def submit_job(req: JobSubmitRequest):
             job_id=job_id,
             pdf_bytes=pdf_bytes,
             filename=req.filename,
+            user_id=user_id,
             title=req.title,
             enable_compile_check=req.enable_compile_check,
         )
@@ -241,10 +363,12 @@ async def submit_job(req: JobSubmitRequest):
 async def list_jobs(
     limit: int = Query(100, ge=1, le=1000),
     status: Optional[str] = Query(None),
+    user: dict = Depends(get_current_user),
 ):
-    """List all jobs with optional status filter"""
+    """List user's jobs with optional status filter"""
+    user_id = user["sub"]
     try:
-        jobs = database.list_jobs(limit=limit, status=status)
+        jobs = database.list_jobs(limit=limit, status=status, user_id=user_id)
         return {"jobs": jobs}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list jobs: {e}")
@@ -275,11 +399,17 @@ async def cancel_job(job_id: str):
 
 
 @app.delete("/jobs/{job_id}")
-async def delete_job(job_id: str):
+async def delete_job(job_id: str, user: dict = Depends(get_current_user)):
     """Delete a job"""
+    user_id = user["sub"]
     job = database.get_job(job_id)
+
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    # Verify ownership
+    if job["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to delete this job")
 
     # Delete files
     if job["pdf_path"]:

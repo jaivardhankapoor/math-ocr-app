@@ -49,6 +49,7 @@ class JobQueue:
         job_id: str,
         pdf_bytes: bytes,
         filename: str,
+        user_id: str,
         title: Optional[str] = None,
         enable_compile_check: bool = False,
     ):
@@ -62,7 +63,7 @@ class JobQueue:
         pdf_path.write_bytes(pdf_bytes)
 
         # Create job in database
-        database.create_job(job_id, filename, title, enable_compile_check)
+        database.create_job(job_id, filename, user_id, title, enable_compile_check)
 
         # Update paths
         output_path = job_dir / "output.tex"
