@@ -88,7 +88,7 @@ export default function Home() {
 
     const file = files[0]; // For now, only convert first file
 
-    try:
+    try {
       // Read file as base64
       const base64 = await new Promise<string>((resolve, reject) => {
         const reader = new FileReader();
