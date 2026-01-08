@@ -24,6 +24,23 @@ def get_db():
 def init_db():
     """Initialize database schema"""
     with get_db() as conn:
+        # Users table
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                name TEXT,
+                image TEXT,
+                tier TEXT DEFAULT 'free',
+                stripe_customer_id TEXT,
+                stripe_subscription_id TEXT,
+                created_at REAL NOT NULL
+            )
+        """
+        )
+
+        # Jobs table
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS jobs (
@@ -39,18 +56,110 @@ def init_db():
                 latex TEXT,
                 error TEXT,
                 enable_compile_check BOOLEAN DEFAULT 0,
+                user_id TEXT,
                 created_at REAL NOT NULL,
                 started_at REAL,
-                completed_at REAL
+                completed_at REAL,
+                FOREIGN KEY (user_id) REFERENCES users(id)
             )
         """
         )
+
+        # Create index for user_id lookups
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_user_id ON jobs(user_id)"
+        )
+
         conn.commit()
+
+
+def create_user(
+    user_id: str, email: str, name: Optional[str] = None, image: Optional[str] = None
+) -> Dict[str, Any]:
+    """Create or update a user"""
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (id, email, name, image, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                email=excluded.email,
+                name=excluded.name,
+                image=excluded.image
+        """,
+            (user_id, email, name, image, time.time()),
+        )
+        conn.commit()
+        return get_user(user_id)
+
+
+def get_user(user_id: str) -> Optional[Dict[str, Any]]:
+    """Get a user by ID"""
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
+    """Get a user by email"""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE email = ?", (email,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_users(limit: int = 100) -> List[Dict[str, Any]]:
+    """List all users"""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM users ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def update_user_tier(
+    user_id: str,
+    tier: str,
+    stripe_customer_id: Optional[str] = None,
+    stripe_subscription_id: Optional[str] = None,
+):
+    """Update user tier and Stripe info"""
+    with get_db() as conn:
+        updates = ["tier = ?"]
+        params = [tier]
+
+        if stripe_customer_id is not None:
+            updates.append("stripe_customer_id = ?")
+            params.append(stripe_customer_id)
+
+        if stripe_subscription_id is not None:
+            updates.append("stripe_subscription_id = ?")
+            params.append(stripe_subscription_id)
+
+        params.append(user_id)
+
+        conn.execute(
+            f"UPDATE users SET {', '.join(updates)} WHERE id = ?", params
+        )
+        conn.commit()
+
+
+def get_user_job_count_24h(user_id: str) -> int:
+    """Count jobs submitted by user in last 24 hours"""
+    cutoff = time.time() - (24 * 60 * 60)
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE user_id = ? AND created_at > ?",
+            (user_id, cutoff),
+        ).fetchone()
+        return row[0] if row else 0
 
 
 def create_job(
     job_id: str,
     filename: str,
+    user_id: str,
     title: Optional[str] = None,
     enable_compile_check: bool = False,
 ) -> Dict[str, Any]:
@@ -59,10 +168,10 @@ def create_job(
         conn.execute(
             """
             INSERT INTO jobs (
-                id, filename, title, status, enable_compile_check, created_at
-            ) VALUES (?, ?, ?, 'queued', ?, ?)
+                id, filename, title, status, enable_compile_check, user_id, created_at
+            ) VALUES (?, ?, ?, 'queued', ?, ?, ?)
         """,
-            (job_id, filename, title, enable_compile_check, time.time()),
+            (job_id, filename, title, enable_compile_check, user_id, time.time()),
         )
         conn.commit()
         return get_job(job_id)
@@ -76,19 +185,26 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
 
 
 def list_jobs(
-    limit: int = 100, status: Optional[str] = None
+    limit: int = 100, status: Optional[str] = None, user_id: Optional[str] = None
 ) -> List[Dict[str, Any]]:
-    """List jobs with optional status filter"""
+    """List jobs with optional status and user_id filter"""
     with get_db() as conn:
+        conditions = []
+        params = []
+
         if status:
-            rows = conn.execute(
-                "SELECT * FROM jobs WHERE status = ? ORDER BY created_at DESC LIMIT ?",
-                (status, limit),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)
-            ).fetchall()
+            conditions.append("status = ?")
+            params.append(status)
+
+        if user_id:
+            conditions.append("user_id = ?")
+            params.append(user_id)
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        query = f"SELECT * FROM jobs WHERE {where_clause} ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+
+        rows = conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
 
 
