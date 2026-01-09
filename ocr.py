@@ -18,6 +18,8 @@ from PIL import Image
 from prompts import FIX_PROMPT, PAGE_PROMPT, REFINE_PROMPT
 
 MODEL = "gemini-3-flash-preview"
+MAX_OUTPUT_TOKENS = 65536
+TEMPERATURE = 1.0
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
 
@@ -58,7 +60,11 @@ def extract_page(
         resp = client.models.generate_content(
             model=MODEL,
             contents=contents,
-            config=types.GenerateContentConfig(temperature=0.1, candidate_count=1),
+            config=types.GenerateContentConfig(
+                temperature=TEMPERATURE,
+                candidate_count=1,
+                max_output_tokens=MAX_OUTPUT_TOKENS,
+            ),
         )
         log.info(f"  ✓ Received response for page {page_num}")
     except Exception as e:
@@ -71,6 +77,40 @@ def extract_page(
         return f"% Page {page_num}: no content\n"
 
     return f"% Page {page_num}\n{text}\n"
+
+
+def extract_latex_block(text: str) -> str:
+    """Extract LaTeX from markdown code blocks if present."""
+    import re
+
+    result = (text or "").strip()
+    for pattern in [
+        r"```latex\s*\n(.*?)\n```",
+        r"```tex\s*\n(.*?)\n```",
+        r"```\s*\n(.*?)\n```",
+    ]:
+        matches = re.findall(pattern, result, re.DOTALL | re.IGNORECASE)
+        if matches and "\\documentclass" in matches[0]:
+            return matches[0].strip()
+
+    return result
+
+
+def extract_document_parts(doc: str):
+    """Return (preamble, body, has_end) for a LaTeX document."""
+    import re
+
+    text = doc or ""
+    start = text.find("\\begin{document}")
+    end = text.find("\\end{document}")
+
+    if start == -1:
+        return "", text.strip(), False
+
+    preamble = text[:start].rstrip()
+    body_start = start + len("\\begin{document}")
+    body = text[body_start:end].strip() if end != -1 else text[body_start:].strip()
+    return preamble, body, end != -1
 
 
 def refine(
@@ -99,25 +139,57 @@ def refine(
     resp = client.models.generate_content(
         model=MODEL,
         contents=[prompt],
-        config=types.GenerateContentConfig(temperature=0.15, candidate_count=1),
+        config=types.GenerateContentConfig(
+            temperature=TEMPERATURE,
+            candidate_count=1,
+            max_output_tokens=MAX_OUTPUT_TOKENS,
+        ),
     )
 
-    result = (resp.text or "").strip()
+    result = extract_latex_block(resp.text or "")
+    preamble, body, has_end = extract_document_parts(result)
 
-    # Extract LaTeX from markdown code blocks if present
-    import re
+    if has_end or not body:
+        return result
 
-    for pattern in [
-        r"```latex\s*\n(.*?)\n```",
-        r"```tex\s*\n(.*?)\n```",
-        r"```\s*\n(.*?)\n```",
-    ]:
-        matches = re.findall(pattern, result, re.DOTALL | re.IGNORECASE)
-        if matches and "\\documentclass" in matches[0]:
-            result = matches[0].strip()
-            break
+    # Fallback: refine in chunks to avoid truncation.
+    chunk_size = 6
+    chunk_bodies = []
+    chunk_preamble = ""
 
-    return result
+    for i in range(0, len(bodies), chunk_size):
+        chunk = "\n\n% ==== PAGE BREAK ====\n\n".join(
+            [b for b in bodies[i:i + chunk_size] if b.strip()]
+        )
+        if not chunk:
+            continue
+
+        chunk_prompt = REFINE_PROMPT.format(
+            title=title,
+            labels=labels_instruction,
+            body=chunk,
+        )
+        chunk_resp = client.models.generate_content(
+            model=MODEL,
+            contents=[chunk_prompt],
+            config=types.GenerateContentConfig(
+                temperature=TEMPERATURE,
+                candidate_count=1,
+                max_output_tokens=MAX_OUTPUT_TOKENS,
+            ),
+        )
+        chunk_result = extract_latex_block(chunk_resp.text or "")
+        chunk_preamble_candidate, chunk_body, _ = extract_document_parts(chunk_result)
+        if not chunk_preamble and chunk_preamble_candidate:
+            chunk_preamble = chunk_preamble_candidate
+        chunk_bodies.append(chunk_body)
+
+    if not chunk_bodies:
+        return result
+
+    final_preamble = chunk_preamble or preamble or "\\documentclass{article}"
+    combined_body = "\n\n% ==== SECTION BREAK ====\n\n".join(chunk_bodies)
+    return f"{final_preamble}\n\\begin{{document}}\n{combined_body}\n\\end{{document}}"
 
 
 def compile_fix(
@@ -181,7 +253,11 @@ def compile_fix(
         resp = client.models.generate_content(
             model=MODEL,
             contents=[fix_prompt],
-            config=types.GenerateContentConfig(temperature=0.1, candidate_count=1),
+            config=types.GenerateContentConfig(
+                temperature=TEMPERATURE,
+                candidate_count=1,
+                max_output_tokens=MAX_OUTPUT_TOKENS,
+            ),
         )
 
         fixed = (resp.text or "").strip()
