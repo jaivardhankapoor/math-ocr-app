@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
+import { useSession } from "next-auth/react";
 
 interface Job {
   id: string;
@@ -17,16 +18,43 @@ interface Job {
   completed_at: number | null;
 }
 
+interface UserInfo {
+  id: string;
+  email: string;
+  name: string | null;
+  tier: string;
+  usage_24h: number;
+  limit: number;
+}
+
 export default function Home() {
+  const { data: session, status: sessionStatus } = useSession();
   const [files, setFiles] = useState<File[]>([]);
   const [converting, setConverting] = useState(false);
   const [result, setResult] = useState<Job | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [apiStatus, setApiStatus] = useState<'checking' | 'online' | 'offline'>('checking');
   const [jobs, setJobs] = useState<Job[]>([]);
+  const [userInfo, setUserInfo] = useState<UserInfo | null>(null);
+  const [upgrading, setUpgrading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+
+  async function getAuthToken(): Promise<string | null> {
+    if (!session?.user) return null;
+
+    try {
+      const response = await fetch('/api/token');
+      if (!response.ok) return null;
+
+      const data = await response.json();
+      return data.token;
+    } catch (err) {
+      console.error('Failed to get auth token:', err);
+      return null;
+    }
+  }
 
   // Check API status on mount
   useEffect(() => {
@@ -43,11 +71,50 @@ export default function Home() {
     return () => clearInterval(interval);
   }, [apiUrl]);
 
+  // Fetch user info on login
+  useEffect(() => {
+    if (!session?.user) {
+      setUserInfo(null);
+      return;
+    }
+
+    const fetchUserInfo = async () => {
+      try {
+        const token = await getAuthToken();
+        if (!token) return;
+
+        const response = await fetch(`${apiUrl}/users/me`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          setUserInfo(data);
+        }
+      } catch (err) {
+        console.error('Failed to fetch user info:', err);
+      }
+    };
+
+    fetchUserInfo();
+  }, [session, apiUrl]);
+
   // Poll jobs every 2 seconds
   useEffect(() => {
+    if (!session?.user) {
+      setJobs([]);
+      return;
+    }
+
     const fetchJobs = async () => {
       try {
-        const response = await fetch(`${apiUrl}/jobs?limit=50`);
+        const token = await getAuthToken();
+        if (!token) return;
+
+        const response = await fetch(`${apiUrl}/jobs?limit=50`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+
         if (response.ok) {
           const data = await response.json();
           setJobs(data.jobs || []);
@@ -60,7 +127,7 @@ export default function Home() {
     fetchJobs();
     const interval = setInterval(fetchJobs, 2000); // Poll every 2 seconds
     return () => clearInterval(interval);
-  }, [apiUrl]);
+  }, [session, apiUrl]);
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
@@ -89,6 +156,11 @@ export default function Home() {
     const file = files[0]; // For now, only convert first file
 
     try {
+      const token = await getAuthToken();
+      if (!token) {
+        throw new Error('Not authenticated');
+      }
+
       // Read file as base64
       const base64 = await new Promise<string>((resolve, reject) => {
         const reader = new FileReader();
@@ -102,7 +174,10 @@ export default function Home() {
       // Submit job to queue
       const response = await fetch(`${apiUrl}/jobs`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
         body: JSON.stringify({
           pdf_base64: base64Data,
           filename: file.name,
@@ -119,6 +194,14 @@ export default function Home() {
       const data = await response.json();
       console.log(`Job submitted: ${data.job_id}`);
 
+      // Refresh user info to update usage
+      const userResponse = await fetch(`${apiUrl}/users/me`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (userResponse.ok) {
+        setUserInfo(await userResponse.json());
+      }
+
       // Clear file selection
       setFiles([]);
     } catch (err) {
@@ -130,8 +213,12 @@ export default function Home() {
 
   const handleCancelJob = async (jobId: string) => {
     try {
+      const token = await getAuthToken();
+      if (!token) return;
+
       const response = await fetch(`${apiUrl}/jobs/${jobId}/cancel`, {
         method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
       });
       if (!response.ok) {
         throw new Error('Failed to cancel job');
@@ -143,14 +230,41 @@ export default function Home() {
 
   const handleDeleteJob = async (jobId: string) => {
     try {
+      const token = await getAuthToken();
+      if (!token) return;
+
       const response = await fetch(`${apiUrl}/jobs/${jobId}`, {
         method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
       });
       if (!response.ok) {
         throw new Error('Failed to delete job');
       }
     } catch (err) {
       console.error('Failed to delete job:', err);
+    }
+  };
+
+  const handleUpgrade = async () => {
+    setUpgrading(true);
+    try {
+      const response = await fetch('/api/stripe/create-checkout', {
+        method: 'POST',
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to create checkout session');
+      }
+
+      const { url } = await response.json();
+      if (url) {
+        window.location.href = url;
+      }
+    } catch (err) {
+      console.error('Failed to upgrade:', err);
+      setError('Failed to start upgrade process');
+    } finally {
+      setUpgrading(false);
     }
   };
 
@@ -184,9 +298,72 @@ export default function Home() {
     );
   };
 
+  // Show loading while checking auth
+  if (sessionStatus === "loading") {
+    return (
+      <div className="flex items-center justify-center min-h-screen">
+        <p className="text-gray-600 dark:text-gray-400">Loading...</p>
+      </div>
+    );
+  }
+
+  // Show login prompt if not authenticated
+  if (!session?.user) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen p-8">
+        <h1 className="text-4xl font-bold text-gray-900 dark:text-white mb-4">
+          Math OCR - PDF to LaTeX
+        </h1>
+        <p className="text-gray-600 dark:text-gray-300 mb-8 text-center max-w-md">
+          Convert handwritten math notes to LaTeX using Gemini 3 Flash.
+          Sign in with Google to get started.
+        </p>
+        <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">
+          Free tier: 3 PDFs per day
+        </p>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 dark:from-gray-900 dark:to-gray-800 p-8">
       <div className="max-w-4xl mx-auto">
+        {/* Usage Quota Banner */}
+        {userInfo && (
+          <div className={`mb-6 rounded-lg p-4 border ${
+            userInfo.tier === 'unlimited'
+              ? 'bg-purple-50 dark:bg-purple-900/20 border-purple-200 dark:border-purple-800'
+              : userInfo.tier === 'paid'
+              ? 'bg-blue-50 dark:bg-blue-900/20 border-blue-200 dark:border-blue-800'
+              : userInfo.usage_24h >= userInfo.limit
+              ? 'bg-red-50 dark:bg-red-900/20 border-red-200 dark:border-red-800'
+              : 'bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-800'
+          }`}>
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="font-semibold text-gray-900 dark:text-white">
+                  {userInfo.tier === 'unlimited' ? 'Unlimited Plan' : userInfo.tier === 'paid' ? 'Pro Plan' : 'Free Plan'}
+                </p>
+                <p className="text-sm text-gray-700 dark:text-gray-300">
+                  {userInfo.tier === 'unlimited'
+                    ? 'No limits on conversions'
+                    : `${userInfo.usage_24h}/${userInfo.limit} conversions used today`
+                  }
+                </p>
+              </div>
+              {userInfo.tier === 'free' && (
+                <button
+                  onClick={handleUpgrade}
+                  disabled={upgrading}
+                  className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg font-medium disabled:bg-gray-400 disabled:cursor-not-allowed"
+                >
+                  {upgrading ? 'Loading...' : 'Upgrade to Pro $9.99/mo'}
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* API Status Banner */}
         {apiStatus === 'offline' && (
           <div className="mb-6 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 rounded-lg p-4">
