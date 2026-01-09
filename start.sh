@@ -13,6 +13,14 @@ if [ -f ".env.local" ]; then
   echo ""
 fi
 
+# Avoid macOS fork safety crashes in worker processes
+export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
+
+# Ensure REDIS_URL has a default for local dev
+if [ -z "$REDIS_URL" ]; then
+  REDIS_URL="redis://localhost:6379/0"
+fi
+
 # Check if GEMINI_API_KEY is set
 if [ -z "$GEMINI_API_KEY" ]; then
   echo "WARNING: GEMINI_API_KEY not set!"
@@ -75,6 +83,7 @@ echo ""
 echo "Starting servers..."
 echo "  - Python API: http://localhost:8000"
 echo "  - Next.js UI: http://localhost:3000"
+echo "  - Redis: $REDIS_URL"
 echo "  - RQ Worker: background"
 echo ""
 echo "Press Ctrl+C to stop both servers"
@@ -85,6 +94,9 @@ cleanup() {
   echo ""
   echo "Stopping servers..."
   kill $API_PID $WORKER_PID $NEXTJS_PID 2>/dev/null || true
+  if [ "$REDIS_STARTED" = "1" ] && command -v redis-cli &> /dev/null; then
+    redis-cli shutdown &> /dev/null || true
+  fi
   exit 0
 }
 
@@ -97,6 +109,23 @@ API_PID=$!
 
 # Wait a bit for API to start
 sleep 2
+
+# Start Redis if using local default and it's not running
+if [ "$REDIS_URL" = "redis://localhost:6379/0" ] || [ "$REDIS_URL" = "redis://127.0.0.1:6379/0" ]; then
+  if command -v redis-cli &> /dev/null; then
+    if ! redis-cli ping &> /dev/null; then
+      if command -v redis-server &> /dev/null; then
+        echo "Starting Redis..."
+        redis-server --daemonize yes
+        REDIS_STARTED=1
+      else
+        echo "WARNING: redis-server not found. Install Redis or set REDIS_URL."
+      fi
+    fi
+  else
+    echo "WARNING: redis-cli not found. Install Redis or set REDIS_URL."
+  fi
+fi
 
 # Start RQ worker in background
 echo "Starting RQ worker..."
