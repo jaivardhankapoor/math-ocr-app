@@ -17,6 +17,7 @@ from jose import jwt, JWTError
 
 from ocr import convert
 import database
+from database import RateLimitExceeded
 from job_queue import get_job_queue
 
 # Get NextAuth secret from environment
@@ -144,9 +145,14 @@ async def startup_event():
     async def cleanup_task():
         while True:
             await asyncio.sleep(3600)  # 1 hour
-            deleted = database.cleanup_old_jobs(days=7)
-            if deleted > 0:
-                print(f"Cleaned up {deleted} old jobs")
+            deleted_paths = database.cleanup_old_jobs(days=7)
+            if deleted_paths:
+                for pdf_path in deleted_paths:
+                    job_dir = Path(pdf_path).parent
+                    if job_dir.exists():
+                        import shutil
+                        shutil.rmtree(job_dir, ignore_errors=True)
+                print(f"Cleaned up {len(deleted_paths)} old jobs")
 
     asyncio.create_task(cleanup_task())
 
@@ -181,9 +187,16 @@ async def sync_user(req: UserSyncRequest, user: dict = Depends(get_current_user)
     # Verify the token user matches the request
     if user["sub"] != req.id:
         raise HTTPException(status_code=403, detail="Token mismatch")
+    if user.get("email") and req.email and user["email"] != req.email:
+        raise HTTPException(status_code=403, detail="Email mismatch")
 
     # Create or update user
-    db_user = database.create_user(req.id, req.email, req.name, req.image)
+    db_user = database.create_user(
+        req.id,
+        user.get("email") or req.email,
+        user.get("name") or req.name,
+        user.get("picture") or req.image,
+    )
     return {"message": "User synced", "user": db_user}
 
 
@@ -246,7 +259,7 @@ async def update_tier(
 
 
 @app.post("/convert", response_model=ConvertResponse)
-async def convert_pdf(req: ConvertRequest, _: dict = Depends(get_current_user)):
+async def convert_pdf(req: ConvertRequest, _: None = Depends(require_internal_key)):
     """
     Convert PDF to LaTeX.
 
@@ -320,7 +333,7 @@ async def convert_upload(
     file: UploadFile = File(...),
     title: Optional[str] = Form(None),
     enable_compile_check: bool = Form(False),
-    _: dict = Depends(get_current_user),
+    _: None = Depends(require_internal_key),
 ):
     """
     Convert PDF to LaTeX (multipart/form-data upload).
@@ -415,7 +428,15 @@ async def submit_job(req: JobSubmitRequest, user: dict = Depends(get_current_use
     # Generate job ID
     job_id = str(uuid.uuid4())
 
-    # Submit to queue first (creates job in DB atomically)
+    tier = db_user["tier"]
+    if tier == "unlimited":
+        daily_limit = None
+    elif tier == "paid":
+        daily_limit = 50
+    else:
+        daily_limit = 3
+
+    # Submit to queue (creates job in DB atomically with limit enforcement)
     try:
         get_job_queue().submit_job(
             job_id=job_id,
@@ -424,33 +445,19 @@ async def submit_job(req: JobSubmitRequest, user: dict = Depends(get_current_use
             user_id=user_id,
             title=req.title,
             enable_compile_check=req.enable_compile_check,
+            daily_limit=daily_limit,
+        )
+    except RateLimitExceeded as e:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Daily limit reached ({e.count}/{e.limit}). Upgrade to Pro for 50/day."
+                if daily_limit == 3
+                else f"Daily limit reached ({e.count}/{e.limit}). Try again tomorrow."
+            ),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to submit job: {e}")
-
-    # Check rate limit AFTER creating job (more atomic, prevents race condition)
-    tier = db_user["tier"]
-    usage_24h = database.get_user_job_count_24h(user_id)
-
-    limit_exceeded = False
-    error_detail = ""
-
-    if tier == "unlimited":
-        pass  # No limit
-    elif tier == "paid":
-        if usage_24h > 50:  # Note: > not >= since we just created one
-            limit_exceeded = True
-            error_detail = f"Daily limit reached ({usage_24h-1}/50). Try again tomorrow."
-    else:  # free tier
-        if usage_24h > 3:  # Note: > not >= since we just created one
-            limit_exceeded = True
-            error_detail = f"Daily limit reached ({usage_24h-1}/3). Upgrade to Pro for 50/day."
-
-    if limit_exceeded:
-        # Cancel and delete the job we just created
-        get_job_queue().cancel_job(job_id)
-        database.delete_job(job_id)
-        raise HTTPException(status_code=429, detail=error_detail)
 
     return JobSubmitResponse(job_id=job_id, status="queued")
 

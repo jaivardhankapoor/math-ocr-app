@@ -7,6 +7,13 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 from contextlib import contextmanager
 
+
+class RateLimitExceeded(Exception):
+    def __init__(self, count: int, limit: int):
+        super().__init__(f"Daily limit reached ({count}/{limit})")
+        self.count = count
+        self.limit = limit
+
 DB_PATH = Path("jobs.db")
 
 
@@ -177,6 +184,45 @@ def create_job(
         return get_job(job_id)
 
 
+def create_job_with_limit(
+    job_id: str,
+    filename: str,
+    user_id: str,
+    title: Optional[str] = None,
+    enable_compile_check: bool = False,
+    daily_limit: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Create a job with optional daily usage limit enforcement"""
+    cutoff = time.time() - (24 * 60 * 60)
+    with get_db() as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            if daily_limit is not None:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE user_id = ? AND created_at > ?",
+                    (user_id, cutoff),
+                ).fetchone()
+                count = row[0] if row else 0
+                if count >= daily_limit:
+                    raise RateLimitExceeded(count=count, limit=daily_limit)
+
+            conn.execute(
+                """
+                INSERT INTO jobs (
+                    id, filename, title, status, enable_compile_check, user_id, created_at
+                ) VALUES (?, ?, ?, 'queued', ?, ?, ?)
+            """,
+                (job_id, filename, title, enable_compile_check, user_id, time.time()),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        return get_job(job_id)
+
+
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Get a single job by ID"""
     with get_db() as conn:
@@ -283,13 +329,16 @@ def delete_job(job_id: str):
         conn.commit()
 
 
-def cleanup_old_jobs(days: int = 7):
-    """Delete jobs older than specified days"""
+def cleanup_old_jobs(days: int = 7) -> List[str]:
+    """Delete jobs older than specified days, returning affected job directories"""
     cutoff = time.time() - (days * 24 * 60 * 60)
+    deleted_paths: List[str] = []
     with get_db() as conn:
-        cursor = conn.execute(
-            "DELETE FROM jobs WHERE created_at < ?", (cutoff,)
-        )
-        deleted = cursor.rowcount
+        rows = conn.execute(
+            "SELECT pdf_path FROM jobs WHERE created_at < ?", (cutoff,)
+        ).fetchall()
+        deleted_paths = [row["pdf_path"] for row in rows if row["pdf_path"]]
+
+        conn.execute("DELETE FROM jobs WHERE created_at < ?", (cutoff,))
         conn.commit()
-        return deleted
+        return deleted_paths

@@ -52,26 +52,34 @@ class JobQueue:
         user_id: str,
         title: Optional[str] = None,
         enable_compile_check: bool = False,
+        daily_limit: Optional[int] = None,
     ):
         """Submit a new job to the queue"""
-        # Create job directory
+        # Create job in database first to enforce limits
+        database.create_job_with_limit(
+            job_id,
+            filename,
+            user_id,
+            title,
+            enable_compile_check,
+            daily_limit,
+        )
+
         job_dir = JOBS_DIR / job_id
-        job_dir.mkdir(parents=True, exist_ok=True)
-
-        # Save PDF file
-        pdf_path = job_dir / "input.pdf"
-        pdf_path.write_bytes(pdf_bytes)
-
-        # Create job in database
-        database.create_job(job_id, filename, user_id, title, enable_compile_check)
-
-        # Update paths
         output_path = job_dir / "output.tex"
-        database.update_job_paths(job_id, str(pdf_path), str(output_path))
+        pdf_path = job_dir / "input.pdf"
 
-        # Add to queue
-        self.queue.put(job_id)
-        log.info(f"Job {job_id} submitted to queue")
+        try:
+            job_dir.mkdir(parents=True, exist_ok=True)
+            pdf_path.write_bytes(pdf_bytes)
+            database.update_job_paths(job_id, str(pdf_path), str(output_path))
+            self.queue.put(job_id)
+            log.info(f"Job {job_id} submitted to queue")
+        except Exception:
+            database.delete_job(job_id)
+            if job_dir.exists():
+                shutil.rmtree(job_dir, ignore_errors=True)
+            raise
 
     def cancel_job(self, job_id: str) -> bool:
         """Cancel a running or queued job"""
