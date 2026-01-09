@@ -9,24 +9,16 @@ async function updateUserTier(
   stripeCustomerId: string | null,
   stripeSubscriptionId: string | null
 ) {
-  const jose = await import("jose");
-  const secret = new TextEncoder().encode(process.env.NEXTAUTH_SECRET!);
-
-  const token = await new jose.SignJWT({
-    sub: userId,
-    email: "",
-    name: "",
-    iat: Math.floor(Date.now() / 1000),
-    exp: Math.floor(Date.now() / 1000) + 3600,
-  })
-    .setProtectedHeader({ alg: "HS256" })
-    .sign(secret);
+  const internalKey = process.env.INTERNAL_API_KEY;
+  if (!internalKey) {
+    throw new Error("INTERNAL_API_KEY not configured");
+  }
 
   const response = await fetch(`${API_URL}/users/${userId}/tier`, {
     method: "PUT",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
+      "X-Internal-API-Key": internalKey,
     },
     body: JSON.stringify({
       tier,

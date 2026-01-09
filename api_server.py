@@ -21,15 +21,22 @@ from job_queue import get_job_queue
 
 # Get NextAuth secret from environment
 NEXTAUTH_SECRET = os.getenv("NEXTAUTH_SECRET", "")
-if not NEXTAUTH_SECRET:
-    print("WARNING: NEXTAUTH_SECRET not set. Auth will not work!")
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "")
+MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
+if not NEXTAUTH_SECRET or len(NEXTAUTH_SECRET) < 32:
+    raise ValueError(
+        "NEXTAUTH_SECRET must be set and at least 32 characters. "
+        "Generate with: openssl rand -base64 32"
+    )
 
 app = FastAPI(title="Math OCR API", version="1.0.0")
 
 # Enable CORS for Next.js frontend
+# In production, set FRONTEND_URL to your deployed domain
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict to your Vercel domain
+    allow_origins=[FRONTEND_URL],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -102,6 +109,29 @@ async def get_current_user(authorization: str = Header(...)) -> dict:
 
     except JWTError as e:
         raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+
+
+def require_internal_key(
+    internal_key: Optional[str] = Header(None, alias="X-Internal-API-Key"),
+) -> None:
+    if not INTERNAL_API_KEY:
+        raise HTTPException(status_code=500, detail="Internal auth not configured")
+    if not internal_key or internal_key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+
+def estimate_base64_size(b64_data: str) -> int:
+    trimmed = "".join(b64_data.split())
+    padding = trimmed.count("=")
+    return max(0, (len(trimmed) * 3) // 4 - padding)
+
+
+def enforce_pdf_size(pdf_bytes: bytes):
+    if len(pdf_bytes) > MAX_PDF_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"PDF too large (max {MAX_PDF_BYTES // (1024 * 1024)}MB)",
+        )
 
 
 @app.on_event("startup")
@@ -189,8 +219,34 @@ async def get_me(user: dict = Depends(get_current_user)):
     )
 
 
+class UpdateTierRequest(BaseModel):
+    tier: str
+    stripe_customer_id: Optional[str] = None
+    stripe_subscription_id: Optional[str] = None
+
+
+@app.put("/users/{user_id}/tier")
+async def update_tier(
+    user_id: str,
+    req: UpdateTierRequest,
+    _: None = Depends(require_internal_key),
+):
+    """Update user tier (called by Stripe webhook or admin)"""
+    if req.tier not in ("free", "paid", "unlimited"):
+        raise HTTPException(status_code=400, detail="Invalid tier")
+
+    database.update_user_tier(
+        user_id,
+        req.tier,
+        req.stripe_customer_id,
+        req.stripe_subscription_id
+    )
+
+    return {"message": "Tier updated", "tier": req.tier}
+
+
 @app.post("/convert", response_model=ConvertResponse)
-async def convert_pdf(req: ConvertRequest):
+async def convert_pdf(req: ConvertRequest, _: dict = Depends(get_current_user)):
     """
     Convert PDF to LaTeX.
 
@@ -204,16 +260,27 @@ async def convert_pdf(req: ConvertRequest):
     if not api_key:
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY not configured")
 
+    if req.filename and not req.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+
+    if estimate_base64_size(req.pdf_base64) > MAX_PDF_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"PDF too large (max {MAX_PDF_BYTES // (1024 * 1024)}MB)",
+        )
+
     # Decode PDF
     try:
-        pdf_bytes = base64.b64decode(req.pdf_base64)
+        pdf_bytes = base64.b64decode(req.pdf_base64, validate=True)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid base64: {e}")
+
+    enforce_pdf_size(pdf_bytes)
 
     # Save to temp file
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
-        pdf_path = tmpdir / req.filename
+        pdf_path = tmpdir / "input.pdf"
         pdf_path.write_bytes(pdf_bytes)
 
         # Convert
@@ -253,16 +320,28 @@ async def convert_upload(
     file: UploadFile = File(...),
     title: Optional[str] = Form(None),
     enable_compile_check: bool = Form(False),
+    _: dict = Depends(get_current_user),
 ):
     """
     Convert PDF to LaTeX (multipart/form-data upload).
 
     Alternative endpoint that accepts file upload directly.
     """
-    if not file.filename.endswith(".pdf"):
+    if not file.filename or not Path(file.filename).suffix.lower() == ".pdf":
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
-    pdf_bytes = await file.read()
+    pdf_buffer = bytearray()
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        pdf_buffer.extend(chunk)
+        if len(pdf_buffer) > MAX_PDF_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"PDF too large (max {MAX_PDF_BYTES // (1024 * 1024)}MB)",
+            )
+    pdf_bytes = bytes(pdf_buffer)
 
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -270,7 +349,7 @@ async def convert_upload(
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
-        pdf_path = tmpdir / file.filename
+        pdf_path = tmpdir / "input.pdf"
         pdf_path.write_bytes(pdf_bytes)
 
         try:
@@ -316,35 +395,27 @@ async def submit_job(req: JobSubmitRequest, user: dict = Depends(get_current_use
     if not db_user:
         raise HTTPException(status_code=404, detail="User not found. Call /users/sync first.")
 
-    # Check rate limit
-    tier = db_user["tier"]
-    usage_24h = database.get_user_job_count_24h(user_id)
+    if req.filename and not req.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
-    if tier == "unlimited":
-        pass  # No limit
-    elif tier == "paid":
-        if usage_24h >= 50:
-            raise HTTPException(
-                status_code=429,
-                detail=f"Daily limit reached ({usage_24h}/50). Try again tomorrow."
-            )
-    else:  # free tier
-        if usage_24h >= 3:
-            raise HTTPException(
-                status_code=429,
-                detail=f"Daily limit reached ({usage_24h}/3). Upgrade to Pro for 50/day."
-            )
+    if estimate_base64_size(req.pdf_base64) > MAX_PDF_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"PDF too large (max {MAX_PDF_BYTES // (1024 * 1024)}MB)",
+        )
 
-    # Decode PDF
+    # Decode PDF first to validate before rate limit check
     try:
-        pdf_bytes = base64.b64decode(req.pdf_base64)
+        pdf_bytes = base64.b64decode(req.pdf_base64, validate=True)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid base64: {e}")
+
+    enforce_pdf_size(pdf_bytes)
 
     # Generate job ID
     job_id = str(uuid.uuid4())
 
-    # Submit to queue
+    # Submit to queue first (creates job in DB atomically)
     try:
         get_job_queue().submit_job(
             job_id=job_id,
@@ -354,9 +425,34 @@ async def submit_job(req: JobSubmitRequest, user: dict = Depends(get_current_use
             title=req.title,
             enable_compile_check=req.enable_compile_check,
         )
-        return JobSubmitResponse(job_id=job_id, status="queued")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to submit job: {e}")
+
+    # Check rate limit AFTER creating job (more atomic, prevents race condition)
+    tier = db_user["tier"]
+    usage_24h = database.get_user_job_count_24h(user_id)
+
+    limit_exceeded = False
+    error_detail = ""
+
+    if tier == "unlimited":
+        pass  # No limit
+    elif tier == "paid":
+        if usage_24h > 50:  # Note: > not >= since we just created one
+            limit_exceeded = True
+            error_detail = f"Daily limit reached ({usage_24h-1}/50). Try again tomorrow."
+    else:  # free tier
+        if usage_24h > 3:  # Note: > not >= since we just created one
+            limit_exceeded = True
+            error_detail = f"Daily limit reached ({usage_24h-1}/3). Upgrade to Pro for 50/day."
+
+    if limit_exceeded:
+        # Cancel and delete the job we just created
+        get_job_queue().cancel_job(job_id)
+        database.delete_job(job_id)
+        raise HTTPException(status_code=429, detail=error_detail)
+
+    return JobSubmitResponse(job_id=job_id, status="queued")
 
 
 @app.get("/jobs")
@@ -375,22 +471,36 @@ async def list_jobs(
 
 
 @app.get("/jobs/{job_id}")
-async def get_job(job_id: str):
+async def get_job(job_id: str, user: dict = Depends(get_current_user)):
     """Get a single job by ID"""
+    user_id = user["sub"]
     job = database.get_job(job_id)
+
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    # Verify ownership
+    if job["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to view this job")
+
     return job
 
 
 @app.post("/jobs/{job_id}/cancel")
-async def cancel_job(job_id: str):
+async def cancel_job(job_id: str, user: dict = Depends(get_current_user)):
     """Cancel a running or queued job"""
+    user_id = user["sub"]
+    job = database.get_job(job_id)
+
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Verify ownership
+    if job["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to cancel this job")
+
     success = get_job_queue().cancel_job(job_id)
     if not success:
-        job = database.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="Job not found")
         raise HTTPException(
             status_code=400,
             detail=f"Job cannot be cancelled (status: {job['status']})"
@@ -424,11 +534,17 @@ async def delete_job(job_id: str, user: dict = Depends(get_current_user)):
 
 
 @app.get("/jobs/{job_id}/download")
-async def download_job(job_id: str):
+async def download_job(job_id: str, user: dict = Depends(get_current_user)):
     """Download the LaTeX output file"""
+    user_id = user["sub"]
     job = database.get_job(job_id)
+
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    # Verify ownership
+    if job["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to download this job")
 
     if job["status"] != "completed":
         raise HTTPException(
