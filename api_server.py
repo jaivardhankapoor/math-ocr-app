@@ -18,7 +18,7 @@ from jose import jwt, JWTError
 from ocr import convert
 import database
 from database import RateLimitExceeded
-from job_queue import get_job_queue
+from job_queue import enqueue_job
 
 # Get NextAuth secret from environment
 NEXTAUTH_SECRET = os.getenv("NEXTAUTH_SECRET", "")
@@ -139,7 +139,6 @@ def enforce_pdf_size(pdf_bytes: bytes):
 async def startup_event():
     """Initialize database and start job queue worker"""
     database.init_db()
-    get_job_queue().start()
 
     # Schedule cleanup task (runs every hour)
     async def cleanup_task():
@@ -160,7 +159,7 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Stop job queue worker gracefully"""
-    get_job_queue().stop()
+    pass
 
 
 @app.get("/")
@@ -438,7 +437,7 @@ async def submit_job(req: JobSubmitRequest, user: dict = Depends(get_current_use
 
     # Submit to queue (creates job in DB atomically with limit enforcement)
     try:
-        get_job_queue().submit_job(
+        enqueue_job(
             job_id=job_id,
             pdf_bytes=pdf_bytes,
             filename=req.filename,
@@ -506,12 +505,13 @@ async def cancel_job(job_id: str, user: dict = Depends(get_current_user)):
     if job["user_id"] != user_id:
         raise HTTPException(status_code=403, detail="Not authorized to cancel this job")
 
-    success = get_job_queue().cancel_job(job_id)
-    if not success:
+    if job["status"] in ("completed", "failed", "cancelled"):
         raise HTTPException(
             status_code=400,
             detail=f"Job cannot be cancelled (status: {job['status']})"
         )
+
+    database.update_job_status(job_id, "cancelled")
     return {"message": "Job cancelled", "job_id": job_id}
 
 

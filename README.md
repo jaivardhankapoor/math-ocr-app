@@ -6,16 +6,16 @@ Convert handwritten math notes (PDF) to LaTeX using Google Gemini 3 Flash.
 
 ### System Overview
 ```
-+------------------+       HTTP        +------------------+
-|                  |  POST /convert    |                  |
-|   Next.js App    | ---------------->|   FastAPI        |
-|   (port 3000)    | <---------------- |   (port 8000)    |
-|                  |   JSON response   |                  |
-+------------------+                   +------------------+
-        |                                      |
-        v                                      v
-   localStorage                         Gemini 3 Flash API
-   (history)                            (PDF -> LaTeX)
++------------------+       HTTP        +------------------+       enqueue       +------------------+
+|                  |  POST /jobs       |                  | -----------------> |                  |
+|   Next.js App    | ----------------> |   FastAPI        |                    |   RQ Worker      |
+|   (port 3000)    | <---------------- |   (port 8000)    | <----------------- |   (worker.py)    |
+|                  |   JSON response   |                  |      Redis         |                  |
++------------------+                   +------------------+                    +------------------+
+        |                                      |                                         |
+        v                                      v                                         v
+   localStorage                         SQLite (jobs.db)                           Gemini API
+   (history)                            (jobs + users)                             (PDF -> LaTeX)
 ```
 
 ### Python Backend Pipeline
@@ -70,6 +70,11 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 # Install all dependencies
 npm install
 uv sync
+
+# Start Redis (required for job queue)
+# macOS
+brew install redis
+redis-server
 ```
 
 ### 2. Set API Key
@@ -107,6 +112,7 @@ math-ocr-app/
 ├── prompts.py             # Gemini AI prompts
 ├── requirements.txt       # Python dependencies
 ├── pyproject.toml         # uv configuration
+├── worker.py              # RQ worker entrypoint
 ├── app/
 │   ├── page.tsx           # Main UI component
 │   ├── layout.tsx         # Root layout

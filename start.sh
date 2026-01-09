@@ -6,10 +6,17 @@ set -e
 echo "Starting Math OCR App..."
 echo ""
 
+# Load environment variables from .env.local if it exists
+if [ -f ".env.local" ]; then
+  echo "Loading environment variables from .env.local..."
+  export $(grep -v '^#' .env.local | xargs)
+  echo ""
+fi
+
 # Check if GEMINI_API_KEY is set
 if [ -z "$GEMINI_API_KEY" ]; then
   echo "WARNING: GEMINI_API_KEY not set!"
-  echo "   Set it with: export GEMINI_API_KEY='your-key'"
+  echo "   Add it to .env.local or export GEMINI_API_KEY='your-key'"
   echo "   Get your key from: https://aistudio.google.com/apikey"
   echo ""
   read -p "Continue anyway? (y/n) " -n 1 -r
@@ -17,6 +24,14 @@ if [ -z "$GEMINI_API_KEY" ]; then
   if [[ ! $REPLY =~ ^[Yy]$ ]]; then
     exit 1
   fi
+fi
+
+# Check if NEXTAUTH_SECRET is set
+if [ -z "$NEXTAUTH_SECRET" ]; then
+  echo "ERROR: NEXTAUTH_SECRET not set!"
+  echo "   Add it to .env.local (should already be there)"
+  echo "   Or generate one with: openssl rand -base64 32"
+  exit 1
 fi
 
 # Check if uv is installed
@@ -60,6 +75,7 @@ echo ""
 echo "Starting servers..."
 echo "  - Python API: http://localhost:8000"
 echo "  - Next.js UI: http://localhost:3000"
+echo "  - RQ Worker: background"
 echo ""
 echo "Press Ctrl+C to stop both servers"
 echo ""
@@ -68,7 +84,7 @@ echo ""
 cleanup() {
   echo ""
   echo "Stopping servers..."
-  kill $API_PID $NEXTJS_PID 2>/dev/null || true
+  kill $API_PID $WORKER_PID $NEXTJS_PID 2>/dev/null || true
   exit 0
 }
 
@@ -82,10 +98,15 @@ API_PID=$!
 # Wait a bit for API to start
 sleep 2
 
+# Start RQ worker in background
+echo "Starting RQ worker..."
+uv run python worker.py &
+WORKER_PID=$!
+
 # Start Next.js in background
 echo "Starting Next.js dev server..."
 npm run dev &
 NEXTJS_PID=$!
 
 # Wait for both processes
-wait $API_PID $NEXTJS_PID
+wait $API_PID $WORKER_PID $NEXTJS_PID
